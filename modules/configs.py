@@ -82,15 +82,25 @@ class Config:
 
     # @property修饰器可设置属性
     # 这样写可实时响应配置变化
+    def _safe_get_float(self, section: str, option: str, default: float = 0.0) -> float:
+        try:
+            value = self._config.get(section, option, raw=True, fallback='').strip()
+            if not value:
+                return default
+            return float(value)
+        except (ValueError, configparser.Error):
+            return default
+
     @property
     def limitMaxTime(self) -> float:
         self._read_config()
-        return float(self._config.get('course-option', 'limitMaxTime'))
+        return self._safe_get_float('course-option', 'limitMaxTime', 0.0)
 
     @property
     def limitSpeed(self) -> float:
         self._read_config()
-        return float(self._config.get('course-option', 'limitSpeed', raw=True))
+        speed = self._safe_get_float('course-option', 'limitSpeed', 1.0)
+        return min(max(speed, 0.5), 1.8)
 
     @property
     def revise_speed(self) -> str:

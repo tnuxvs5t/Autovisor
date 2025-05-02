@@ -55,15 +55,20 @@ async def get_course_progress(page: Page, is_new_version=False, is_hike_class=Fa
 def show_course_progress(desc, cur_time=None, limit_time=0):
     assert limit_time >= 0, "limit_time 必须为非负数!"
     if limit_time == 0:
-        cur_time = "0%" if cur_time == '' else cur_time
-        percent = int(cur_time.split("%")[0]) + 1  # Handles a 1% rendering error
-        if percent >= 80:  # In learning mode, 80% progress is considered complete
+        cur_time = "0%" if cur_time == '' or cur_time is None else cur_time
+        if isinstance(cur_time, (int, float)):
+            percent = int(cur_time)
+        else:
+            percent = int(str(cur_time).split("%")[0]) + 1
+        if percent >= 80:
             percent = 100
         length = int(percent * 30 // 100)
         progress = ("█" * length).ljust(30, " ")
         print(f"\r{desc} |{progress}| {percent}%\t".ljust(50), end="", flush=True)
     else:
-        cur_time = 0 if cur_time == '' else cur_time
+        cur_time = 0 if cur_time == '' or cur_time is None else cur_time
+        if isinstance(cur_time, str):
+            cur_time = 0
         left_time = round(limit_time - cur_time, 1)
         percent = int(cur_time / limit_time * 100)
         if left_time <= 0:
