@@ -62,6 +62,7 @@ def show_course_progress(desc, cur_time=None, limit_time=0):
             percent = int(str(cur_time).split("%")[0]) + 1
         if percent >= 80:
             percent = 100
+        percent = max(0, min(percent, 100))
         length = int(percent * 30 // 100)
         progress = ("█" * length).ljust(30, " ")
         print(f"\r{desc} |{progress}| {percent}%\t".ljust(50), end="", flush=True)
@@ -73,6 +74,7 @@ def show_course_progress(desc, cur_time=None, limit_time=0):
         percent = int(cur_time / limit_time * 100)
         if left_time <= 0:
             percent = 100
+        percent = max(0, min(percent, 100))
         length = int(percent * 20 // 100)
         progress = ("█" * length).ljust(20, " ")
         print(f"\r{desc} |{progress}| {percent}%\t剩余 {left_time} min\t".ljust(50), end="", flush=True)
