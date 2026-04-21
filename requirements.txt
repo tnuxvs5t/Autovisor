@@ -1,8 +1,5 @@
-opencv-python~=4.10.0.82
-numpy~=1.26.2
-pyinstaller~=6.13.0
-playwright~=1.52.0
-PyGetWindow~=0.0.9
-requests~=2.31.0
-Pillow~=10.1.0
-httpx~=0.27.0
+playwright==1.58.0
+Pillow==12.2.0
+PyGetWindow==0.0.9
+pyinstaller==6.19.0
+sv-ttk==2.6.1

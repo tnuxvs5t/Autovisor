@@ -1,27 +1,26 @@
 import os
 import shutil
+
 name = "Autovisor"
 
 cmd = (
-    f"pyinstaller "
-    f"--log-level=INFO "
-    f"--noconfirm "
-    f"-c "
-    f"-i ./res/zhs.ico "
-    f"--onedir "
-    f"--contents-directory=internal "
+    "pyinstaller "
+    "--log-level=INFO "
+    "--noconfirm "
+    "-c "
+    "-i ./res/zhs.ico "
+    "--onedir "
+    "--contents-directory=internal "
     f"--name={name} "
-    f"./Autovisor.py "
-    f"--exclude-module cv2 "
-    f"--exclude-module numpy "
-    f"--exclude-module matplotlib "
+    "./Autovisor.py"
 )
 os.system(cmd)
 
-os.mkdir(f"./dist/{name}/res")
-open(f"./dist/{name}/为防止启动失败, 建议使用Chrome浏览器", "w").close()
+os.makedirs(f"./dist/{name}/res", exist_ok=True)
+open(f"./dist/{name}/建议使用Chrome浏览器启动", "w", encoding="utf-8").close()
 shutil.copyfile("./res/QRcode.jpg", f"./dist/{name}/res/QRcode.jpg")
 shutil.copyfile("./configs.ini", f"./dist/{name}/configs.ini")
 shutil.copyfile("./res/stealth.min.js", f"./dist/{name}/res/stealth.min.js")
 shutil.rmtree("./build", ignore_errors=True)
-os.remove("./Autovisor.spec")
+if os.path.exists("./Autovisor.spec"):
+    os.remove("./Autovisor.spec")

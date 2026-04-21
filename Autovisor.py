@@ -1,28 +1,78 @@
 # encoding=utf-8
 import asyncio
-import os
+import sys
 import time
 import traceback
-import sys
-from playwright.async_api import async_playwright, Playwright, Page, BrowserContext
-from playwright.async_api import TimeoutError
+from dataclasses import dataclass, field
+
 from playwright._impl._errors import TargetClosedError
-from modules.logger import Logger
+from playwright.async_api import Browser, BrowserContext, Page, Playwright, TimeoutError, async_playwright
+
 from modules.configs import Config
-from modules.progress import get_course_progress, show_course_progress
+from modules.logger import Logger
+from modules.progress import show_course_progress
 from modules.support import show_donate
-from modules.utils import optimize_page, get_lesson_name, get_filtered_class, get_video_attr, hide_window, \
-    get_browser_window, bring_console_to_front, save_cookies, load_cookies
-from modules.slider import slider_verify
-from modules.tasks import video_optimize, play_video, skip_questions, wait_for_verify, activate_window, task_monitor
-from modules import installer
+from modules.tasks import activate_window, play_video, skip_questions, status_ocr_stream, task_monitor, video_optimize, wait_for_verify
+from modules.utils import (
+    click_card_by_id,
+    get_browser_window,
+    get_lesson_name,
+    get_video_attr,
+    hide_window,
+    load_cookies,
+    optimize_page,
+    save_cookies,
+    scan_pending_lessons_deep,
+)
 
-# 获取全局事件循环
-event_loop_verify = asyncio.Event()
-event_loop_answer = asyncio.Event()
+logger = Logger()
+config: Config
 
 
-async def init_page(p: Playwright) -> tuple[Page, BrowserContext]:
+@dataclass
+class WorkerSession:
+    worker_id: int
+    context: BrowserContext
+    page: Page
+    verify_event: asyncio.Event = field(default_factory=asyncio.Event)
+    answer_event: asyncio.Event = field(default_factory=asyncio.Event)
+    restart_event: asyncio.Event = field(default_factory=asyncio.Event)
+    tasks: list[asyncio.Task] = field(default_factory=list)
+
+    @property
+    def name(self) -> str:
+        return f"W{self.worker_id}"
+
+
+class WorkerRestart(Exception):
+    pass
+
+
+class ClaimManager:
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._claimed: set[str] = set()
+
+    @staticmethod
+    def make_key(course_url: str, lesson: dict) -> str:
+        return f"{course_url}|{lesson.get('scope_id', 'window')}|{lesson.get('card_id', '')}|{lesson.get('title', '')}"
+
+    async def claim(self, course_url: str, lesson: dict) -> str | None:
+        key = self.make_key(course_url, lesson)
+        async with self._lock:
+            if key in self._claimed:
+                return None
+            self._claimed.add(key)
+            return key
+
+    async def release(self, claim_key: str | None) -> None:
+        if not claim_key:
+            return
+        async with self._lock:
+            self._claimed.discard(claim_key)
+
+
+async def launch_browser(p: Playwright) -> tuple[Browser, str]:
     driver = "msedge" if config.driver == "edge" else config.driver
     logger.info(f"正在启动{config.driver}浏览器...")
     browser = await p.chromium.launch(
@@ -30,234 +80,354 @@ async def init_page(p: Playwright) -> tuple[Page, BrowserContext]:
         headless=False,
         executable_path=config.exe_path if config.exe_path else None,
         args=[
-            f'--window-size={1600},{900}',
-            '--window-position=100,100',  # 窗口位置
+            "--window-size=1600,900",
+            "--window-position=100,100",
         ],
     )
+    with open("res/stealth.min.js", "r", encoding="utf-8") as f:
+        stealth_js = f.read()
+    return browser, stealth_js
+
+
+async def create_context(browser: Browser, stealth_js: str, cookies: list | None = None) -> BrowserContext:
     context = await browser.new_context()
-    # 加载 Cookies
-    cookies = load_cookies("res/cookies.json")
+    await context.add_init_script(stealth_js)
     if cookies:
         await context.add_cookies(cookies)
-        logger.info("已加载 Cookies!")
-    else:
-        logger.info("未找到 Cookies,将跳转至登录页.")
-    page = await context.new_page()
-    logger.write_log(f"{config.driver}浏览器启动完成.\n")
-    #抹去特征
-    with open('res/stealth.min.js', 'r') as f:
-        js = f.read()
-    await page.add_init_script(js)
-    logger.write_log(f"stealth.js执行完成.\n")
+    return context
+
+
+async def bootstrap_login(browser: Browser, stealth_js: str) -> list:
+    bootstrap_context = await create_context(browser, stealth_js, load_cookies("res/cookies.json"))
+    page = await bootstrap_context.new_page()
     page.set_default_timeout(24 * 3600 * 1000)
 
-    return page, context
-
-async def auto_login(context: BrowserContext, page: Page, modules=None):
     async def request_handler(request):
         if "https://www.zhihuishu.com" in request.url:
-            cookies = await context.cookies()
+            cookies = await bootstrap_context.cookies()
             save_cookies(cookies, "res/cookies.json")
-            logger.info(f"已保存登录凭证到: res/cookies.json,下次可免密登录.")
-            # 停止监听
-            page.remove_listener('request', request_handler)
+            logger.info("已保存登录凭证到: res/cookies.json,下次可免密登录.")
+            page.remove_listener("request", request_handler)
 
     await page.goto(config.login_url, wait_until="commit")
-    if "login" not in page.url:
+    if "login" in page.url:
+        logger.info("正在等待登录完成...")
+        page.on("request", request_handler)
+        if config.username and config.password:
+            await page.wait_for_selector("#lUsername", state="attached")
+            await page.wait_for_selector("#lPassword", state="attached")
+            await page.locator("#lUsername").fill(config.username)
+            await page.locator("#lPassword").fill(config.password)
+            await page.wait_for_selector(".wall-sub-btn", state="attached")
+            await page.wait_for_timeout(500)
+            await page.locator(".wall-sub-btn").first.click()
+        await page.wait_for_selector(".wall-main", state="hidden")
+    else:
         logger.info("检测到已登录,跳过登录步骤.")
-        return
-    await page.wait_for_selector(".wall-main", state='attached')  # 等待登陆界面加载
-    page.on('request', request_handler)
-    if config.username and config.password:
-        await page.wait_for_selector("#lUsername", state="attached")
-        await page.wait_for_selector("#lPassword", state="attached")
-        await page.locator('#lUsername').fill(config.username)
-        await page.locator('#lPassword').fill(config.password)
-        await page.wait_for_selector(".wall-sub-btn", state="attached")
-        await page.wait_for_timeout(500)
-        await page.locator(".wall-sub-btn").first.click()
-    if config.enableAutoCaptcha and modules:
-        await slider_verify(page, modules)
-    await page.wait_for_selector(".wall-main", state='hidden')
+
+    cookies = await bootstrap_context.cookies()
+    save_cookies(cookies, "res/cookies.json")
+    await bootstrap_context.close()
+    return cookies
 
 
-async def learning_loop(page: Page, start_time, is_new_version=False, is_hike_class=False):
-    cur_time = await get_course_progress(page, is_new_version, is_hike_class)
-    while cur_time != "100%":
+async def create_worker(browser: Browser, stealth_js: str, cookies: list, worker_id: int) -> WorkerSession:
+    context = await create_context(browser, stealth_js, cookies)
+    page = await context.new_page()
+    page.set_default_timeout(24 * 3600 * 1000)
+    session = WorkerSession(worker_id=worker_id, context=context, page=page)
+
+    verify_task = asyncio.create_task(wait_for_verify(page, config, session.verify_event, session.name))
+    video_task = asyncio.create_task(video_optimize(page, config))
+    answer_task = asyncio.create_task(skip_questions(page, session.answer_event))
+    play_task = asyncio.create_task(play_video(page, session.name, session.restart_event))
+    ocr_task = asyncio.create_task(status_ocr_stream(page, session.name, config.statusInterval, session.restart_event))
+    session.tasks.extend([verify_task, video_task, answer_task, play_task, ocr_task])
+
+    if config.enableHideWindow:
         try:
-            limit_time = config.limitMaxTime
-            time_period = (time.time() - start_time) / 60
-            if 0 < limit_time <= time_period:
-                break
-            cur_time = await get_course_progress(page, is_new_version, is_hike_class)
-            show_course_progress(desc="完成进度:", cur_time=cur_time)
-            await asyncio.sleep(0.5)
-        except TimeoutError as e:
-            if await page.query_selector(".yidun_modal__title"):
-                await event_loop_verify.wait()
-            elif await page.query_selector(".topic-title"):
-                await event_loop_answer.wait()
-            else:
-                logger.warn(repr(e))
+            window = await get_browser_window(page)
+            session.tasks.append(asyncio.create_task(activate_window(window)))
+            await hide_window(page)
+        except Exception:
+            pass
+
+    return session
 
 
-async def review_loop(page: Page, start_time, is_hike_class=False):
-    total_time = await get_video_attr(page, "duration")
-    await page.evaluate(config.reset_curtime)  # 重置视频播放时间
+async def close_worker(session: WorkerSession) -> None:
+    for task in session.tasks:
+        task.cancel()
+    if session.tasks:
+        await asyncio.gather(*session.tasks, return_exceptions=True)
+    try:
+        await session.context.close()
+    except Exception:
+        pass
+
+
+def reset_runtime_events(session: WorkerSession) -> None:
+    session.verify_event.clear()
+    session.answer_event.clear()
+    session.restart_event.clear()
+
+
+async def wait_runtime_block(session: WorkerSession) -> None:
+    if await session.page.query_selector(".yidun_modal__title"):
+        await session.verify_event.wait()
+    elif await session.page.query_selector(".topic-title"):
+        await session.answer_event.wait()
+
+
+async def wait_lesson_completion(session: WorkerSession, title: str, start_time: float) -> str:
+    seen_video = False
     while True:
-        limit_time = config.limitMaxTime
-        cur_time = await get_video_attr(page, "currentTime")
-        if cur_time >= total_time:
-            break
         try:
-            time_period = (time.time() - start_time) / 60
-            if 0 < limit_time <= time_period:
-                break
-            show_course_progress(desc="完成进度:", cur_time=time_period, limit_time=limit_time)
-            await asyncio.sleep(0.5)
-        except TimeoutError as e:
-            if await page.query_selector(".yidun_modal__title"):
-                await event_loop_verify.wait()
-            elif await page.query_selector(".topic-title"):
-                await event_loop_answer.wait()
-            else:
-                logger.warn(repr(e))
+            if session.restart_event.is_set():
+                logger.warn(f"[{session.name}] 收到后台重建信号，立即重建窗口.", shift=True)
+                return "restart"
+            await wait_runtime_block(session)
+            if 0 < config.limitMaxTime <= (time.time() - start_time) / 60:
+                logger.info(f"[{session.name}] \"{title}\" 达到单次观看上限:{config.limitMaxTime}min", shift=True)
+                return "time_limit"
+
+            duration = await get_video_attr(session.page, "duration")
+            current = await get_video_attr(session.page, "currentTime")
+            paused = await get_video_attr(session.page, "paused")
+            ended = await get_video_attr(session.page, "ended")
+            if duration and current is not None:
+                seen_video = True
+                percent = 0 if duration <= 0 else int(min(100, max(0, current / duration * 100)))
+                show_course_progress(f"[{session.name}] 当前节次进度:", f"{percent}%")
+                if ended:
+                    logger.info(f"[{session.name}] \"{title}\" 检测到 ended=True，准备重建窗口.", shift=True)
+                    return "ended"
+                if paused:
+                    logger.info(f"[{session.name}] 监测到暂停态,等待自动续播.")
+                if current >= max(duration - 2, duration * 0.98):
+                    logger.info(f"[{session.name}] \"{title}\" 已进入完成终态，准备重建窗口.", shift=True)
+                    return "restart"
+            elif seen_video:
+                logger.info(f"[{session.name}] \"{title}\" 视频元素消失，准备重建窗口.", shift=True)
+                return "restart"
+            await asyncio.sleep(2)
+        except TimeoutError:
+            await wait_runtime_block(session)
 
 
-async def working_loop(page: Page, is_new_version=False, is_hike_class=False):
-    # 获取所有课程元素
-    if is_hike_class:
-        await page.wait_for_selector(".file-item", state="attached")
-    else:
-        await page.wait_for_selector(".clearfix.video", state="attached")
-    to_learn_class = await get_filtered_class(page, is_new_version, is_hike_class)
-    learning = True if len(to_learn_class) > 0 else False
-    if learning:
-        all_class = to_learn_class
-    else:
-        all_class = await get_filtered_class(page, is_new_version, is_hike_class, include_all=True)
-    start_time = time.time()
-    cur_index = 0
+async def reload_course_page(session: WorkerSession, course_url: str, is_new_version=False, is_hike_class=False) -> None:
+    await session.page.goto(course_url, wait_until="commit")
+    await optimize_page(session.page, config, is_new_version, is_hike_class)
 
-    while cur_index < len(all_class):
-        await all_class[cur_index].click()
-        if is_hike_class:
-            await page.wait_for_selector(".file-item.active", state="attached")
-        else:
-            await page.wait_for_selector(".current_play", state="attached")
-        await page.wait_for_timeout(1000)
-        title = await get_lesson_name(page, is_hike_class)
-        logger.info(f"正在学习:{title}")
-        page.set_default_timeout(10000)
-        # 移除视频暂停功能
-        await page.wait_for_selector("video", state="attached")
-        await page.evaluate(config.remove_pause)
-        if learning:
-            await learning_loop(page, start_time, is_new_version, is_hike_class)
-        else:
-            await review_loop(page, start_time, is_hike_class)
-        if is_hike_class is False:
-            if "current_play" in await all_class[cur_index].get_attribute('class'):
-                cur_index += 1
-        else:
-            if "active" in await all_class[cur_index].get_attribute('class'):
-                cur_index += 1
-        reachTimeLimit = await check_time_limit(page, start_time, all_class, title, is_hike_class)
-        if reachTimeLimit:
+
+async def get_course_title(page: Page) -> str:
+    selectors = (
+        ".source-name",
+        ".course-name",
+        "h1",
+        "h2",
+        '[class*="title"]',
+        '[class*="Title"]',
+    )
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if await locator.count():
+                text = await locator.text_content()
+                if text and text.strip():
+                    return text.strip()
+        except Exception:
+            continue
+    try:
+        title = await page.title()
+        if title and title.strip():
+            return title.strip()
+    except Exception:
+        pass
+    return "未识别课程标题"
+
+
+async def open_and_watch_lesson(
+    session: WorkerSession,
+    lesson: dict,
+    claim_key: str,
+    claim_manager: ClaimManager,
+    course_url: str,
+    is_new_version=False,
+    is_hike_class=False,
+) -> None:
+    title = lesson["title"]
+    result = "unknown"
+    try:
+        if not await click_card_by_id(
+            session.page,
+            lesson["card_id"],
+            title,
+            lesson.get("scope_id"),
+            lesson.get("top"),
+        ):
+            logger.warn(f"[{session.name}] 未能定位卡片:{title}, 本轮跳过.", shift=True)
             return
 
-
-async def check_time_limit(page: Page, start_time, all_class, title, is_hike_class) -> bool:
-    reachTimeLimit = False
-    page.set_default_timeout(24 * 3600 * 1000)
-    time_period = (time.time() - start_time) / 60
-    if 0 < config.limitMaxTime <= time_period:
-        logger.info(f"当前课程已达时限:{config.limitMaxTime}min", shift=True)
-        logger.info("即将进入下门课程!")
-        reachTimeLimit = True
-    else:
-        class_name = await all_class[-1].get_attribute('class')
-        if is_hike_class:
-            if "active" in class_name:
-                logger.info("已学完本课程全部内容!", shift=True)
-                print("==" * 10)
-            else:
-                logger.info(f"\"{title}\" 已完成!", shift=True)
-                logger.info(f"本次课程已学习:{time_period:.1f} min")
-        else:
-            if "current_play" in class_name:
-                logger.info("已学完本课程全部内容!", shift=True)
-                print("==" * 10)
-            else:
-                logger.info(f"\"{title}\" 已完成!", shift=True)
-                logger.info(f"本次课程已学习:{time_period:.1f} min")
-    return reachTimeLimit
+        logger.info(
+            f"[{session.name}] 锁定蓝条未满节次: {lesson.get('section', '')} / {title} ({lesson['progress']}%)"
+        )
+        await session.page.wait_for_timeout(1000)
+        try:
+            current_title = await get_lesson_name(session.page, is_hike_class) or title
+        except Exception:
+            current_title = title
+        logger.info(f"[{session.name}] 开始观看:{current_title}")
+        try:
+            await session.page.wait_for_selector("video", state="attached", timeout=15000)
+            await session.page.evaluate(config.remove_pause)
+        except Exception:
+            logger.warn(f"[{session.name}] 未及时检测到视频元素,进入宽松等待模式.", shift=True)
+        start_time = time.time()
+        result = await wait_lesson_completion(session, current_title, start_time)
+    finally:
+        await claim_manager.release(claim_key)
+        if result in {"ended", "restart", "completed", "video_disappeared"}:
+            raise WorkerRestart(f"{session.name} ended state restart")
+        await reload_course_page(session, course_url, is_new_version, is_hike_class)
 
 
-async def main():
-    modules, tasks = [], []
-    if config.enableAutoCaptcha:
-        print("===== Install log =====")
-        logger.info("正在检查依赖库...")
-        modules = installer.start()
-        logger.info("所有依赖库安装完成!")
-    print("===== Runtime Log =====")
+async def process_course(session: WorkerSession, course_url: str, claim_manager: ClaimManager) -> bool:
+    is_new_version = "fusioncourseh5" in course_url
+    is_hike_class = "hike.zhihuishu.com" in course_url
+    logger.info(f"[{session.name}] 正在加载课程母页...")
+    await session.page.goto(course_url, wait_until="commit")
+    await optimize_page(session.page, config, is_new_version, is_hike_class)
+    logger.info(f"[{session.name}] 当前页面: {session.page.url}")
+    course_title = await get_course_title(session.page)
+    logger.info(f"[{session.name}] 当前课程:<<{course_title}>>")
+
+    logger.info(f"[{session.name}] 开始运行时滚动扫描...", shift=True)
+    pending_lessons, summary = await scan_pending_lessons_deep(session.page)
+    logger.info(
+        f"[{session.name}] 整页统计: 总卡片 {summary['total']} | 未完成 {summary['pending']} | 已完成 {summary['done']}",
+        shift=True,
+    )
+    if summary["sections"]:
+        top_sections = []
+        for section, stats in summary["sections"].items():
+            top_sections.append(f"{section}:{stats['pending']}/{stats['total']}")
+        logger.info(f"[{session.name}] 分组统计: {' | '.join(top_sections[:6])}")
+
+    if not pending_lessons:
+        return False
+
+    for lesson in pending_lessons:
+        claim_key = await claim_manager.claim(course_url, lesson)
+        if not claim_key:
+            continue
+        reset_runtime_events(session)
+        await open_and_watch_lesson(
+            session,
+            lesson,
+            claim_key,
+            claim_manager,
+            course_url,
+            is_new_version,
+            is_hike_class,
+        )
+        return True
+    return False
+
+
+async def worker_loop(
+    session: WorkerSession,
+    browser: Browser,
+    stealth_js: str,
+    cookies: list,
+    claim_manager: ClaimManager,
+    start_offset: int,
+    all_tasks: list[asyncio.Task],
+) -> None:
+    course_total = len(config.course_urls)
+    while True:
+        if session.restart_event.is_set():
+            raise WorkerRestart(f"{session.name} restart requested")
+        did_work = False
+        for offset in range(course_total):
+            if session.restart_event.is_set():
+                raise WorkerRestart(f"{session.name} restart requested")
+            course_url = config.course_urls[(start_offset + offset) % course_total]
+            try:
+                if await process_course(session, course_url, claim_manager):
+                    did_work = True
+            except WorkerRestart:
+                logger.warn(f"[{session.name}] 检测到播放结束态，销毁并重建 worker.", shift=True)
+                try:
+                    await session.page.close()
+                except Exception:
+                    pass
+                await close_worker(session)
+                await asyncio.sleep(1)
+                new_session = await create_worker(browser, stealth_js, cookies, session.worker_id)
+                session.context = new_session.context
+                session.page = new_session.page
+                session.verify_event = new_session.verify_event
+                session.answer_event = new_session.answer_event
+                session.restart_event = new_session.restart_event
+                session.tasks = new_session.tasks
+                all_tasks.extend(new_session.tasks)
+                did_work = True
+                break
+            except TargetClosedError:
+                logger.warn(f"[{session.name}] 页面/上下文已关闭，立即重建 worker.", shift=True)
+                await close_worker(session)
+                await asyncio.sleep(1)
+                new_session = await create_worker(browser, stealth_js, cookies, session.worker_id)
+                session.context = new_session.context
+                session.page = new_session.page
+                session.verify_event = new_session.verify_event
+                session.answer_event = new_session.answer_event
+                session.restart_event = new_session.restart_event
+                session.tasks = new_session.tasks
+                all_tasks.extend(new_session.tasks)
+                did_work = True
+                break
+            except Exception as e:
+                logger.error(f"[{session.name}] {repr(e)}", shift=True)
+                logger.write_log(traceback.format_exc())
+        if not did_work:
+            logger.info(f"[{session.name}] 本轮未领取到新任务, {config.scanInterval}s 后继续轮询.", shift=True)
+            await asyncio.sleep(config.scanInterval)
+
+
+async def main() -> None:
     async with async_playwright() as p:
-        page, context = await init_page(p)
-        # 进行登录
-        if not config.username or not config.password:
-            logger.info("请手动填写账号密码...")
-        logger.info("正在等待登录完成...")
-        # 先启动人机验证协程
-        verify_task = asyncio.create_task(wait_for_verify(page, config, event_loop_verify))
-        await auto_login(context, page, modules)
+        browser, stealth_js = await launch_browser(p)
+        cookies = await bootstrap_login(browser, stealth_js)
 
-        # 启动协程任务
-        video_optimize_task = asyncio.create_task(video_optimize(page, config))
-        skip_ques_task = asyncio.create_task(skip_questions(page, event_loop_answer))
-        play_video_task = asyncio.create_task(play_video(page))
-        tasks.extend([verify_task, video_optimize_task, skip_ques_task, play_video_task])
-        # 隐藏窗口
-        if config.enableHideWindow:
-            window = await get_browser_window(page)
-            activate_window_task = asyncio.create_task(activate_window(window))
-            tasks.append(activate_window_task)
-            await hide_window(page)
+        worker_total = max(1, config.parallelTasks)
+        logger.info(f"并行窗口上限: {worker_total}")
 
-        # 任务监视器
-        monitor_task = asyncio.create_task(task_monitor(tasks))
-        # 遍历所有课程,加载网页
-        for course_url in config.course_urls:
-            print("==" * 10)
-            is_new_version = "fusioncourseh5" in course_url
-            is_hike_class = "hike.zhihuishu.com" in course_url  # 判断是否为翻转课
-            logger.info("正在加载播放页...")
-            await page.goto(course_url, wait_until="commit")
-            # 关闭弹窗,优化页面结构
-            await optimize_page(page, config, is_new_version, is_hike_class)
-            logger.info("页面优化完成!")
-            # 获取课程标题
-            if not is_new_version and is_hike_class is False:
-                title_selector = await page.wait_for_selector(".source-name")
-                course_title = await title_selector.text_content()
-                logger.info(f"当前课程:<<{course_title}>>")
-            if is_hike_class:
-                title_selector = await page.wait_for_selector(".course-name")
-                course_title = await title_selector.text_content()
-                logger.info(f"当前课程:<<{course_title}>>， 是翻转课哎")
-            # 启动课程主循环
-            await working_loop(page, is_new_version=is_new_version, is_hike_class=is_hike_class)
-    print("==" * 10)
-    logger.info("所有课程已学习完毕!")
-    show_donate("res/QRcode.jpg")
-    # 结束所有协程任务
-    await asyncio.gather(*tasks, return_exceptions=True) if tasks else None
-    await monitor_task
+        sessions = []
+        all_tasks: list[asyncio.Task] = []
+        claim_manager = ClaimManager()
+
+        for worker_id in range(1, worker_total + 1):
+            session = await create_worker(browser, stealth_js, cookies, worker_id)
+            sessions.append(session)
+            all_tasks.extend(session.tasks)
+
+        worker_tasks = [
+            asyncio.create_task(
+                worker_loop(session, browser, stealth_js, cookies, claim_manager, session.worker_id - 1, all_tasks)
+            )
+            for session in sessions
+        ]
+        all_tasks.extend(worker_tasks)
+
+        monitor_task = asyncio.create_task(task_monitor(all_tasks))
+        await asyncio.gather(*worker_tasks)
+        await monitor_task
 
 
 if __name__ == "__main__":
     print("Github:CXRunfree All Rights Reserved.")
-    logger = Logger()
     try:
         logger.info("程序启动中...")
         config = Config("configs.ini")
@@ -266,6 +436,8 @@ if __name__ == "__main__":
             time.sleep(2)
             sys.exit(-1)
         asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.warn("收到手动中断,程序退出.", shift=True)
     except TargetClosedError as e:
         logger.write_log(traceback.format_exc())
         if "BrowserType.launch" in repr(e):
@@ -277,7 +449,7 @@ if __name__ == "__main__":
         logger.error(repr(e), shift=True)
         logger.write_log(traceback.format_exc())
         if isinstance(e, KeyError):
-            logger.error(f"配置文件错误!")
+            logger.error("配置文件错误!")
         elif isinstance(e, FileNotFoundError):
             logger.error(f"依赖文件缺失: {e.filename},请重新安装程序!")
         elif isinstance(e, UnicodeDecodeError):
@@ -286,4 +458,5 @@ if __name__ == "__main__":
             logger.error("系统出错,请检查后重新启动!")
     finally:
         logger.save()
+        show_donate("res/QRcode.jpg")
         input("程序已结束,按Enter退出...")

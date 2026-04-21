@@ -1,27 +1,87 @@
 import asyncio
-import traceback
 
+from playwright._impl._errors import TargetClosedError
 from playwright.async_api import Page
 from pygetwindow import Win32Window
+
 from modules.configs import Config
-from modules.utils import get_video_attr, display_window, hide_window
-from playwright._impl._errors import TargetClosedError
 from modules.logger import Logger
+from modules.utils import display_window, get_video_attr, hide_window
 
 logger = Logger()
+
+STATUS_PROBE_JS = r"""
+() => {
+    const normalize = (text) => (text || '').replace(/\s+/g, ' ').trim();
+    const visibleText = [];
+    for (const el of Array.from(document.querySelectorAll('body *'))) {
+        if (visibleText.length >= 5) break;
+        const text = normalize(el.textContent || '');
+        if (!text) continue;
+        if (!(text.includes('学习进度') || text.includes('掌握度') || text.includes('%'))) continue;
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        if (rect.width < 40 || rect.height < 16) continue;
+        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
+        if (!visibleText.includes(text)) {
+            visibleText.push(text.slice(0, 80));
+        }
+    }
+
+    const titleSelectors = ['#lessonOrder', '.current_play [title]', '.current_play', 'h1', 'h2', '[title]'];
+    let lessonTitle = '';
+    for (const selector of titleSelectors) {
+        const el = document.querySelector(selector);
+        if (!el) continue;
+        lessonTitle = normalize(el.getAttribute && el.getAttribute('title') ? el.getAttribute('title') : el.textContent);
+        if (lessonTitle) break;
+    }
+
+    const video = document.querySelector('video');
+    const currentTime = video ? Number(video.currentTime || 0) : null;
+    const duration = video ? Number(video.duration || 0) : null;
+    const percent = video && duration > 0 ? Math.floor((currentTime / duration) * 100) : null;
+    return {
+        pageTitle: normalize(document.title || ''),
+        lessonTitle,
+        hasVideo: !!video,
+        paused: video ? !!video.paused : null,
+        ended: video ? !!video.ended : null,
+        currentTime,
+        duration,
+        percent,
+        text: visibleText,
+        url: location.href,
+    };
+}
+"""
+
+
+async def trigger_restart(page: Page, worker_name: str, restart_event: asyncio.Event | None = None) -> None:
+    if restart_event is not None and restart_event.is_set():
+        return
+    if restart_event is not None:
+        restart_event.set()
+    logger.warn(f"[{worker_name}] 触发强制重建，立即关闭当前上下文.", shift=True)
+    try:
+        await page.context.close()
+    except Exception:
+        pass
 
 
 async def task_monitor(tasks: list[asyncio.Task]) -> None:
     checked_tasks = set()
     logger.info("任务监控已启动.")
     while any(not task.done() for task in tasks):
-        for i, task in enumerate(tasks):
+        for task in tasks:
             if task.done() and task not in checked_tasks:
                 checked_tasks.add(task)
                 exc = task.exception()
+                if exc is None:
+                    continue
                 func_name = task.get_coro().__name__
                 logger.error(f"任务函数{func_name} 出现异常.", shift=True)
-                logger.write_log(exc)
+                logger.write_log(f"{repr(exc)}\n")
         await asyncio.sleep(1)
     logger.info("任务监控已退出.", shift=True)
 
@@ -38,7 +98,7 @@ async def activate_window(window: Win32Window) -> None:
         except TargetClosedError:
             logger.write_log("浏览器已关闭,窗口激活模块已下线.\n")
             return
-        except Exception as e:
+        except Exception:
             continue
 
 
@@ -59,26 +119,36 @@ async def video_optimize(page: Page, config: Config) -> None:
         except TargetClosedError:
             logger.write_log("浏览器已关闭,视频调节模块已下线.\n")
             return
-        except Exception as e:
+        except Exception:
             continue
 
 
-async def play_video(page: Page) -> None:
+async def play_video(page: Page, worker_name: str = "W?", restart_event: asyncio.Event | None = None) -> None:
     await page.wait_for_load_state("domcontentloaded")
     while True:
         try:
             await asyncio.sleep(2)
             await page.wait_for_selector("video", state="attached", timeout=1000)
+            ended = await page.evaluate("document.querySelector('video').ended")
             paused = await page.evaluate("document.querySelector('video').paused")
+            if ended:
+                await trigger_restart(page, worker_name, restart_event)
+                continue
             if paused:
-                logger.info("检测到视频暂停,正在尝试播放.")
-                await page.wait_for_selector(".videoArea", timeout=1000)
-                await page.evaluate('document.querySelector("video").play();')
-                logger.write_log("视频已恢复播放.\n")
+                logger.info(f"[{worker_name}] 检测到视频暂停,正在尝试播放.")
+                await page.evaluate(
+                    """() => {
+                        const video = document.querySelector('video');
+                        if (video && !video.ended) {
+                            video.play().catch(() => {});
+                        }
+                    }"""
+                )
+                logger.write_log(f"{worker_name} 视频已恢复播放.\n")
         except TargetClosedError:
-            logger.write_log("浏览器已关闭,视频播放模块已下线.\n")
+            logger.write_log(f"{worker_name} 浏览器已关闭,视频播放模块已下线.\n")
             return
-        except Exception as e:
+        except Exception:
             continue
 
 
@@ -106,7 +176,7 @@ async def skip_questions(page: Page, event_loop) -> None:
         except TargetClosedError:
             logger.write_log("浏览器已关闭,答题模块已下线.\n")
             return
-        except Exception as e:
+        except Exception:
             if "fusioncourseh5" in page.url:
                 not_finish_close = await page.query_selector(".el-dialog")
                 if not_finish_close:
@@ -121,23 +191,54 @@ async def skip_questions(page: Page, event_loop) -> None:
             continue
 
 
-async def wait_for_verify(page: Page, config, event_loop) -> None:
+async def wait_for_verify(page: Page, config, event_loop, worker_name: str = "W?") -> None:
     await page.wait_for_load_state("domcontentloaded")
     while True:
         try:
             await asyncio.sleep(3)
             await page.wait_for_selector(".yidun_modal__title", state="attached", timeout=1000)
-            logger.warn("检测到安全验证,请手动完成验证...", shift=True)
+            logger.warn(f"[{worker_name}] 检测到安全验证,请手动完成验证...", shift=True)
             if config.enableHideWindow:
                 await display_window(page)
             await page.wait_for_selector(".yidun_modal__title", state="hidden", timeout=24 * 3600 * 1000)
             event_loop.set()
             if config.enableHideWindow:
                 await hide_window(page)
-            logger.info("安全验证已完成.", shift=True)
-            await asyncio.sleep(30)  # 较长时间内不会再次触发验证
+            logger.info(f"[{worker_name}] 安全验证已完成.", shift=True)
+            await asyncio.sleep(30)
         except TargetClosedError:
-            logger.write_log("浏览器已关闭,安全验证模块已下线.\n")
+            logger.write_log(f"{worker_name} 浏览器已关闭,安全验证模块已下线.\n")
             return
-        except Exception as e:
+        except Exception:
+            continue
+
+
+async def status_ocr_stream(
+    page: Page,
+    worker_name: str,
+    interval_sec: int = 5,
+    restart_event: asyncio.Event | None = None,
+) -> None:
+    await page.wait_for_load_state("domcontentloaded")
+    while True:
+        try:
+            await asyncio.sleep(interval_sec)
+            data = await page.evaluate(STATUS_PROBE_JS)
+            if data["hasVideo"]:
+                cur = 0 if data["currentTime"] is None else data["currentTime"]
+                dur = 0 if data["duration"] is None else data["duration"]
+                logger.info(
+                    f"[{worker_name}/OCR] {data['lessonTitle'] or data['pageTitle']} | "
+                    f"{data['percent'] if data['percent'] is not None else 0}% | "
+                    f"paused={data['paused']} | ended={data['ended']} | {cur:.0f}/{dur:.0f}s"
+                )
+                if data["ended"]:
+                    logger.warn(f"[{worker_name}/OCR] 检测到 ended=True，等待 worker 重建.", shift=True)
+                    await trigger_restart(page, worker_name, restart_event)
+            elif data["text"]:
+                logger.info(f"[{worker_name}/OCR] {' | '.join(data['text'][:3])}")
+        except TargetClosedError:
+            logger.write_log(f"{worker_name} status stream offline.\n")
+            return
+        except Exception:
             continue
